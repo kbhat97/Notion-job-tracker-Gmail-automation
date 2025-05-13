@@ -1,0 +1,284 @@
+// Securely fetch credentials from Script Properties
+const NOTION_API_KEY = PropertiesService.getScriptProperties().getProperty("NOTION_API_KEY");
+const DATABASE_ID = PropertiesService.getScriptProperties().getProperty("DATABASE_ID");
+
+/**
+ * Main function: runs once with full Notion scrape, then incremental updates only.
+ */
+function sendGmailJobsToNotion() {
+  const isFirstRun = !PropertiesService.getScriptProperties().getProperty("initialScrapeDone");
+
+  if (isFirstRun) {
+    Logger.log("Initial run detected. Clearing Notion database...");
+    clearNotionDatabase();
+    Utilities.sleep(3000);
+    PropertiesService.getScriptProperties().setProperty("initialScrapeDone", "true");
+  } else {
+    Logger.log("Subsequent run: skipping database clear.");
+  }
+
+  processGmailEmails();
+}
+
+/**
+ * Deletes all pages in the Notion database (for initial setup only).
+ */
+function clearNotionDatabase() {
+  const queryPayload = {
+    database_id: DATABASE_ID,
+    page_size: 100
+  };
+
+  const options = {
+    method: "post",
+    headers: notionHeaders(),
+    payload: JSON.stringify(queryPayload),
+    muteHttpExceptions: true
+  };
+
+  try {
+    const response = UrlFetchApp.fetch(`https://api.notion.com/v1/databases/${DATABASE_ID}/query`, options);
+    const pages = JSON.parse(response.getContentText()).results || [];
+
+    pages.forEach(page => {
+      deleteNotionPage(page.id);
+      Utilities.sleep(200);
+    });
+
+    Logger.log(`Cleared ${pages.length} pages from Notion.`);
+  } catch (error) {
+    Logger.log("Error during Notion clear: " + error.message);
+  }
+}
+
+/**
+ * Deletes a specific Notion page.
+ */
+function deleteNotionPage(pageId) {
+  const options = {
+    method: "delete",
+    headers: notionHeaders(),
+    muteHttpExceptions: true
+  };
+
+  try {
+    UrlFetchApp.fetch(`https://api.notion.com/v1/pages/${pageId}`, options);
+  } catch (e) {
+    Logger.log("Failed to delete Notion page: " + pageId);
+  }
+}
+
+/**
+ * Processes Gmail emails to extract job applications.
+ */
+function processGmailEmails() {
+  const query = 'subject:(application OR interview OR "job offer" OR "thank you" OR rejected OR declined OR "follow-up" OR "follow up" OR "job opportunity" OR "position") newer_than:3m';
+  const threads = GmailApp.search(query, 0, 500); // Max 500 emails
+
+  Logger.log(`Found ${threads.length} matching threads.`);
+
+  threads.sort((a, b) => b.getLastMessageDate() - a.getLastMessageDate());
+
+  let successCount = 0, skippedCount = 0, errorCount = 0;
+
+  threads.forEach((thread, index) => {
+    const threadId = thread.getId();
+
+    if (isThreadProcessed(threadId)) {
+      skippedCount++;
+      return;
+    }
+
+    try {
+      const messages = thread.getMessages();
+      const latest = messages[messages.length - 1];
+
+      const subject = latest.getSubject();
+      const from = latest.getFrom();
+      const date = latest.getDate();
+      const body = latest.getPlainBody();
+      const snippet = body.substring(0, 500).replace(/[\r\n]+/g, ' ').trim();
+
+      const emailMatch = from.match(/[\w.-]+@[\w.-]+\.\w+/);
+      const emailAddress = emailMatch ? emailMatch[0] : from;
+
+      const status = determineJobStatus(subject, body);
+      const { jobTitle, company } = extractJobDetails(subject, body, from);
+
+      const success = createNotionEntry({
+        threadId, jobTitle, company, status, subject, snippet, date, emailAddress
+      });
+
+      if (success) {
+        markThreadProcessed(threadId);
+        successCount++;
+      } else {
+        errorCount++;
+      }
+    } catch (error) {
+      Logger.log(`Error on thread ${index}: ${error.message}`);
+      errorCount++;
+    }
+
+    if (index % 10 === 0) Utilities.sleep(1000);
+  });
+
+  Logger.log(`✔️ Done. Success: ${successCount}, Skipped: ${skippedCount}, Errors: ${errorCount}`);
+}
+
+/**
+ * Determine job status from email content.
+ */
+function determineJobStatus(subject, body) {
+  const text = (subject + " " + body).toLowerCase();
+
+  if (/interview|invite you to interview/.test(text)) return "Interview";
+  if (/reject|unsuccessful|not moving forward|not selected|other candidates/.test(text)) return "Rejected";
+  if (/follow[- ]?up|following up/.test(text)) return "Followup";
+  if (/offer|pleased to offer/.test(text)) return "Offer";
+
+  return "Applied";
+}
+
+/**
+ * Extract job title and company name intelligently.
+ */
+function extractJobDetails(subject, body, from) {
+  let jobTitle = "N/A";
+  let company = "N/A";
+
+  const companyPatterns = [
+    /(?:thank you for applying to|interview with|position at|role at|team at|opening at)\s+["']?([\w\s&-.]+?)["']?(?:['"]s|\.|,|\s|$)/i
+  ];
+
+  for (const pattern of companyPatterns) {
+    const match = body.match(pattern);
+    if (match && match[1] && !isJobPlatform(match[1])) {
+      company = cleanCompany(match[1]);
+      break;
+    }
+  }
+
+  if (company === "N/A") {
+    const fallback = subject.match(/(?:at|with)\s+["']?([\w\s&-.]+)["']?/i);
+    if (fallback && fallback[1] && !isJobPlatform(fallback[1])) {
+      company = cleanCompany(fallback[1]);
+    }
+  }
+
+  if (company === "N/A" && from) {
+    const nameMatch = from.match(/^"?([^"<@]+?)"?\s*(?:<|$)/);
+    if (nameMatch && nameMatch[1] && nameMatch[1].split(/\s+/).length > 1) {
+      company = cleanCompany(nameMatch[1]);
+    }
+    const domainMatch = from.match(/@([^.]+)\./);
+    if (company === "N/A" && domainMatch && !isCommonEmailDomain(domainMatch[1])) {
+      company = domainMatch[1].split(/[-_]/).map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(" ");
+    }
+  }
+
+  const jobPatterns = [
+    /(?:position|role|application:)\s*["']?([^"']+?)["']?\s*(?:at|with|$)/i,
+    /(.+?)\s*(?:position|role|job)\s*(?:at|with|$)/i,
+    /(.+?)\s*(?:opportunity|opening)/i
+  ];
+
+  for (const pattern of jobPatterns) {
+    const match = subject.match(pattern);
+    if (match && match[1]) {
+      jobTitle = match[1].replace(/^(Re:|Fwd:)\s*/i, '').trim();
+      break;
+    }
+  }
+
+  return { jobTitle, company };
+}
+
+function cleanCompany(name) {
+  return name.replace(/\s+(Inc|LLC|Ltd|Corp|Co|Limited)\.?$/i, '').trim();
+}
+
+/**
+ * Create a Notion entry.
+ */
+function createNotionEntry(data) {
+  const payload = {
+    parent: { database_id: DATABASE_ID },
+    properties: {
+      "Company": { title: [{ text: { content: data.company } }] },
+      "Job Title": { rich_text: [{ text: { content: data.jobTitle } }] },
+      "Status": { select: { name: data.status } },
+      "Email Subject": { rich_text: [{ text: { content: data.subject } }] },
+      "Snippet": { rich_text: [{ text: { content: data.snippet } }] },
+      "Date": { date: { start: data.date.toISOString() } },
+      "From": { email: data.emailAddress }
+    }
+  };
+
+  const options = {
+    method: "post",
+    headers: notionHeaders(),
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  };
+
+  try {
+    const response = UrlFetchApp.fetch("https://api.notion.com/v1/pages", options);
+    const code = response.getResponseCode();
+    if (code >= 400) {
+      Logger.log("Error creating Notion entry: " + response.getContentText());
+      return false;
+    }
+    return true;
+  } catch (e) {
+    Logger.log("Error posting to Notion: " + e.message);
+    return false;
+  }
+}
+
+/**
+ * Get standard Notion API headers.
+ */
+function notionHeaders() {
+  return {
+    "Authorization": `Bearer ${NOTION_API_KEY}`,
+    "Content-Type": "application/json",
+    "Notion-Version": "2022-06-28"
+  };
+}
+
+/**
+ * Check if company is a known job platform.
+ */
+function isJobPlatform(name) {
+  if (!name) return true;
+  const platforms = ['linkedin', 'indeed', 'glassdoor', 'ziprecruiter', 'monster', 'lever', 'workday', 'greenhouse', 'angellist', 'smartrecruiters', 'taleo', 'careerbuilder', 'wellfound'];
+  return platforms.some(p => name.toLowerCase().includes(p));
+}
+
+/**
+ * Check if email domain is generic.
+ */
+function isCommonEmailDomain(domain) {
+  return ['gmail', 'yahoo', 'outlook', 'hotmail', 'aol', 'icloud', 'protonmail'].includes(domain.toLowerCase());
+}
+
+/**
+ * Track processed thread IDs to avoid duplicates.
+ */
+function isThreadProcessed(threadId) {
+  return PropertiesService.getScriptProperties().getProperty(`thread_${threadId}`) === "true";
+}
+
+function markThreadProcessed(threadId) {
+  PropertiesService.getScriptProperties().setProperty(`thread_${threadId}`, "true");
+}
+
+/**
+ * Create a daily trigger (optional setup)
+ */
+function createDailyTrigger() {
+  ScriptApp.getProjectTriggers().forEach(t => ScriptApp.deleteTrigger(t));
+  ScriptApp.newTrigger("sendGmailJobsToNotion").timeBased().everyDays(1).atHour(6).create();
+  Logger.log("📅 Daily trigger set at 6 AM.");
+}

@@ -1,398 +1,184 @@
-// Get API credentials from script properties
-function getNotionCredentials() {
-  const scriptProperties = PropertiesService.getScriptProperties();
+// Replace these with your actual Notion API key and database ID
+const NOTION_API_KEY = 'YOUR_NOTION_API_KEY';
+const NOTION_DATABASE_ID = 'YOUR_NOTION_DATABASE_ID';
+
+// Main function to process emails and send to Notion
+function sendGmailJobsToNotion() {
+  Logger.log("🧼 Clearing Notion database before processing emails...");
+  clearNotionDatabase();
+
+  Logger.log("📨 Starting email processing...");
+  const threads = GmailApp.search('subject:("application" OR "applied") newer_than:30d', 0, 200);
+  Logger.log(`Found ${threads.length} matching threads.`);
+
+  threads.forEach(thread => {
+    const messages = thread.getMessages();
+    messages.forEach(message => {
+      const subject = message.getSubject();
+      const body = message.getPlainBody();
+      const from = message.getFrom();
+      const date = message.getDate();
+
+      const company = extractCompanyFromSender(from) || extractCompanyFromBody(body) || "Unknown Company";
+      const jobTitle = extractJobTitle(subject, body) || "Unknown Position";
+      const appliedDate = formatDateForNotion(date);
+
+      const pageData = {
+        parent: { database_id: NOTION_DATABASE_ID },
+        properties: {
+          "Company": {
+            title: [
+              {
+                text: {
+                  content: company
+                }
+              }
+            ]
+          },
+          "Job Title": {
+            rich_text: [
+              {
+                text: {
+                  content: jobTitle
+                }
+              }
+            ]
+          },
+          "Applied Date": {
+            date: {
+              start: appliedDate
+            }
+          }
+        }
+      };
+
+      const options = {
+        method: 'post',
+        headers: notionHeaders(),
+        payload: JSON.stringify(pageData),
+        muteHttpExceptions: true
+      };
+
+      const response = UrlFetchApp.fetch("https://api.notion.com/v1/pages", options);
+      Logger.log(`Added job application to Notion: ${company} - ${jobTitle}`);
+    });
+  });
+}
+
+// Function to clear the Notion database by archiving existing pages
+function clearNotionDatabase() {
+  const queryPayload = {
+    page_size: 100
+  };
+
+  const queryOptions = {
+    method: 'post',
+    headers: notionHeaders(),
+    payload: JSON.stringify(queryPayload),
+    muteHttpExceptions: true
+  };
+
+  const queryResponse = UrlFetchApp.fetch(`https://api.notion.com/v1/databases/${NOTION_DATABASE_ID}/query`, queryOptions);
+  const queryData = JSON.parse(queryResponse.getContentText());
+
+  const ids = queryData.results.map(page => page.id);
+
+  if (ids.length === 0) {
+    Logger.log("No pages to archive.");
+    return;
+  }
+
+  Logger.log(`🗑 Archiving ${ids.length} pages...`);
+
+  ids.forEach(id => {
+    const archiveOptions = {
+      method: 'patch',
+      headers: notionHeaders(),
+      payload: JSON.stringify({ archived: true }),
+      muteHttpExceptions: true
+    };
+    UrlFetchApp.fetch(`https://api.notion.com/v1/pages/${id}`, archiveOptions);
+    Logger.log(`Archived page: ${id}`);
+  });
+}
+
+// Helper function to set Notion API headers
+function notionHeaders() {
   return {
-    apiKey: scriptProperties.getProperty('NOTION_API_KEY'),
-    databaseId: scriptProperties.getProperty('DATABASE_ID')
+    'Authorization': `Bearer ${NOTION_API_KEY}`,
+    'Content-Type': 'application/json',
+    'Notion-Version': '2022-06-28'
   };
 }
 
-function sendGmailJobsToNotion() {
-  const isFirstRun = !PropertiesService.getScriptProperties().getProperty("initialScrapeDone");
-
-  if (isFirstRun) {
-    Logger.log("Initial run detected. Clearing Notion database...");
-    clearNotionDatabase();
-    Utilities.sleep(3000);
-    PropertiesService.getScriptProperties().setProperty("initialScrapeDone", "true");
-  } else {
-    Logger.log("Subsequent run: skipping database clear.");
-  }
-
-  processGmailEmails();
-}
-
-function processGmailEmails() {
-  const query = 'subject:(application OR interview OR "job offer" OR "thank you" OR rejected OR declined OR "follow-up" OR "follow up" OR "job opportunity" OR "position") newer_than:3m';
-  const threads = GmailApp.search(query, 0, 500); // Max 500 emails
-
-  Logger.log(`Found ${threads.length} matching threads.`);
-
-  threads.sort((a, b) => b.getLastMessageDate() - a.getLastMessageDate());
-
-  let successCount = 0, skippedCount = 0, errorCount = 0;
-
-  threads.forEach((thread, index) => {
-    const threadId = thread.getId();
-    const processedData = getProcessedThreadData(threadId);
-
-    try {
-      const messages = thread.getMessages();
-      const latest = messages[messages.length - 1];
-
-      const subject = latest.getSubject();
-      const from = latest.getFrom();
-      const date = latest.getDate();
-      const body = latest.getPlainBody();
-      const snippet = body.substring(0, 500).replace(/[\r\n]+/g, ' ').trim();
-
-      const emailMatch = from.match(/[\w.-]+@[\w.-]+\.\w+/);
-      const emailAddress = emailMatch ? emailMatch[0] : from;
-
-      const status = determineJobStatus(subject, body);
-      const { jobTitle, company } = extractJobDetails(subject, body, from);
-
-      Logger.log(`Processing thread ${threadId}: ${subject} | Status: ${status}`);
-
-      // Force update if the status has not changed (for debugging purposes)
-      if (processedData && processedData.pageId) {
-        if (processedData.status !== status || true) {  // Force update even if status hasn't changed
-          updateNotionStatus(processedData.pageId, status, date);
-          markThreadProcessed(threadId, processedData.pageId, status, date);
-          Logger.log(`🔁 Updated status for thread ${threadId} → ${status}`);
-          successCount++;
-        } else {
-          skippedCount++;
-          Logger.log(`Skipped thread ${threadId} as status didn't change.`);
-          return;
-        }
-      } else {
-        const pageId = createNotionEntry({
-          threadId, jobTitle, company, status, subject, snippet, date, emailAddress
-        });
-
-        if (pageId) {
-          markThreadProcessed(threadId, pageId, status, date);
-          successCount++;
-        } else {
-          errorCount++;
-        }
-      }
-    } catch (error) {
-      Logger.log(`❌ Error on thread ${index}: ${error.message}`);
-      errorCount++;
-    }
-
-    if (index % 10 === 0) Utilities.sleep(1000);
-  });
-
-  Logger.log(`✔️ Done. Success: ${successCount}, Skipped: ${skippedCount}, Errors: ${errorCount}`);
-}
-
-/**
- * Extract job title and company from email content.
- * @param {string} subject - Email subject
- * @param {string} body - Email body
- * @param {string} from - Email sender
- * @return {Object} Object containing jobTitle and company
- */
-function extractJobDetails(subject, body, from) {
-  let jobTitle = "";
-  let company = "";
-  
-  // First, try to extract from the subject
-  // Common patterns in job application emails
-  const subjectPatterns = [
-    // "Job Title at Company"
-    /\b([\w\s\-\.\/&,]+?) at ([\w\s\-\.\/&,]+)/i,
-    // "Company: Job Title"
-    /\b([\w\s\-\.\/&,]+?):\s*([\w\s\-\.\/&,]+)/i,
-    // "Re: Job Title - Company"
-    /Re:\s*([\w\s\-\.\/&,]+?)\s*[-–]\s*([\w\s\-\.\/&,]+)/i,
-    // "Company - Job Title"
-    /([\w\s\-\.\/&,]+?)\s*[-–]\s*([\w\s\-\.\/&,]+)/i,
-    // "Company | Job Title"
-    /([\w\s\-\.\/&,]+?)\s*[|]\s*([\w\s\-\.\/&,]+)/i,
-    // "Job Application for Job Title"
-    /(?:Job Application|Application|Applied) for\s+([\w\s\-\.\/&,]+)/i,
-    // "Job Title - Application"
-    /([\w\s\-\.\/&,]+?)\s*[-–]\s*Application/i
-  ];
-
-  // Try each pattern on the subject
-  for (const pattern of subjectPatterns) {
-    const match = subject.match(pattern);
-    if (match) {
-      // Different patterns have different group positions
-      if (pattern.toString().includes("at")) {
-        jobTitle = match[1].trim();
-        company = match[2].trim();
-      } else if (pattern.toString().includes(":")) {
-        company = match[1].trim();
-        jobTitle = match[2].trim();
-      } else if (pattern.toString().includes("Application for")) {
-        jobTitle = match[1].trim();
-        // Company might be in the from field
-        company = extractCompanyFromSender(from);
-      } else if (pattern.toString().includes("[-–]\\s*Application")) {
-        jobTitle = match[1].trim();
-        company = extractCompanyFromSender(from);
-      } else {
-        // For patterns like "Company - Job Title" or "Company | Job Title"
-        company = match[1].trim();
-        jobTitle = match[2].trim();
-      }
-      break;
-    }
-  }
-
-  // If we couldn't get both from the subject, try the body
-  if (!jobTitle || !company) {
-    // Look for job title in the body if not found
-    if (!jobTitle) {
-      const titleMatch = body.match(/(?:position|job title|role|opportunity)(?:\s+is)?(?:\s+for)?:\s*([\w\s\-\.\/&,]+?)(?:\n|\.|\,|at|with)/i);
-      if (titleMatch) jobTitle = titleMatch[1].trim();
-    }
-    
-    // Look for company in the body if not found
-    if (!company) {
-      const companyMatch = body.match(/(?:at|with|from|join)\s+([\w\s\-\.\/&,]+?)(?:\n|\.|\,|\s+team|\s+for)/i);
-      if (companyMatch) company = companyMatch[1].trim();
-    }
-  }
-
-  // Last resort: extract from the sender if still missing
-  if (!company) {
-    company = extractCompanyFromSender(from);
-  }
-
-  // Clean up the results
-  jobTitle = jobTitle || "Unknown Position";
-  company = company || "Unknown Company";
-  
-  // Limit length to prevent issues
-  jobTitle = jobTitle.substring(0, 100);
-  company = company.substring(0, 100);
-  
-  // Remove common noise words from job titles
-  jobTitle = jobTitle.replace(/^(?:re:|fwd:|fw:)/i, "").trim();
-  
-  // Remove common noise from company names
-  company = company.replace(/^(?:team|careers|jobs|hr|recruiting|talent|people)/i, "").trim();
-  
-  // If company is a job platform, try to extract from elsewhere
-  if (isJobPlatform(company)) {
-    const alternateCompany = extractCompanyFromBody(body);
-    if (alternateCompany) company = alternateCompany;
-  }
-  
-  return { jobTitle, company };
-}
-
-/**
- * Extract company name from sender's email address or name.
- * @param {string} from - Email sender string
- * @return {string} Extracted company name
- */
+// Function to extract company name from the sender's email
 function extractCompanyFromSender(from) {
-  // Try to extract a company name from the sender's email
-  // First, check if there's a display name part
   const nameMatch = from.match(/^"?([^"<]+)"?\s*(?:<.+>)?$/);
   if (nameMatch) {
-    const displayName = nameMatch[1].trim();
-    // Check if display name contains company indicators
-    if (displayName.includes("Team") || 
-        displayName.includes("Recruiting") || 
-        displayName.includes("Careers") ||
-        displayName.includes("HR") ||
-        displayName.includes("Talent")) {
-      return displayName.replace(/team|recruiting|careers|hr|talent/i, "").trim();
+    let displayName = nameMatch[1].trim();
+    displayName = displayName.replace(/team|recruiting|careers|hr|talent|noreply/gi, "").trim();
+
+    const blacklist = ["thank you", "we have", "your application", "do not reply", "noreply", "openings", "jobs", "update", "auto-reply"];
+    if (displayName && !blacklist.some(term => displayName.toLowerCase().includes(term))) {
+      return capitalize(displayName);
     }
-    return displayName;
   }
-  
-  // Extract domain from email address
+
   const emailMatch = from.match(/@([\w-]+)\./i);
   if (emailMatch) {
-    // Convert domain to company name format
-    let domain = emailMatch[1];
+    const domain = emailMatch[1];
     if (!isJobPlatform(domain)) {
-      return domain.charAt(0).toUpperCase() + domain.slice(1);
+      return capitalize(domain);
     }
   }
-  
-  return "Unknown Company";
+
+  return null;
 }
 
-/**
- * Try to extract company name from email body.
- * @param {string} body - Email body
- * @return {string} Extracted company name or empty string
- */
+// Function to extract company name from the email body
 function extractCompanyFromBody(body) {
-  const companyPatterns = [
-    /on behalf of\s+([\w\s\-\.\/&,]+?)(?:\n|\.|\,)/i,
-    /position at\s+([\w\s\-\.\/&,]+?)(?:\n|\.|\,)/i,
-    /join\s+([\w\s\-\.\/&,]+?)(?:'s|\s+team)/i,
-    /welcome to\s+([\w\s\-\.\/&,]+?)(?:'s|\s+hiring)/i
-  ];
-  
-  for (const pattern of companyPatterns) {
-    const match = body.match(pattern);
-    if (match) {
-      return match[1].trim();
+  const lines = body.split('\n');
+  for (let line of lines) {
+    line = line.trim();
+    if (line.toLowerCase().startsWith("company:")) {
+      return capitalize(line.split(":")[1].trim());
     }
   }
-  
-  return "";
+  return null;
 }
 
-/**
- * Determine job status from email content.
- */
-function determineJobStatus(subject, body) {
-  const text = (subject + " " + body).toLowerCase();
+// Function to extract job title from subject or body
+function extractJobTitle(subject, body) {
+  const subjectMatch = subject.match(/application for (.+)/i);
+  if (subjectMatch) {
+    return capitalize(subjectMatch[1].trim());
+  }
 
-  if (/interview|invite you to interview/.test(text)) return "Interview";
-  if (/reject|unsuccessful|not moving forward|not selected|other candidates/.test(text)) return "Rejected";
-  if (/follow[- ]?up|following up/.test(text)) return "Followup";
-  if (/offer|pleased to offer/.test(text)) return "Offer";
+  const bodyMatch = body.match(/position of (.+)/i);
+  if (bodyMatch) {
+    return capitalize(bodyMatch[1].trim());
+  }
 
-  return "Applied";
+  return null;
 }
 
-/**
- * Check if company is a known job platform.
- */
+// Function to capitalize the first letter
+function capitalize(text) {
+  return text.charAt(0).toUpperCase() + text.slice(1);
+}
+
+// Function to check if a domain is a known job platform
 function isJobPlatform(name) {
   if (!name) return true;
-  const platforms = ['linkedin', 'indeed', 'glassdoor', 'ziprecruiter', 'monster', 'lever', 'workday', 'greenhouse', 'angellist', 'smartrecruiters', 'taleo', 'careerbuilder', 'wellfound'];
+  const platforms = [
+    'linkedin', 'indeed', 'glassdoor', 'ziprecruiter', 'monster',
+    'lever', 'workday', 'greenhouse', 'angellist', 'smartrecruiters',
+    'taleo', 'careerbuilder', 'wellfound', 'jobvite', 'hiringthing'
+  ];
   return platforms.some(p => name.toLowerCase().includes(p));
 }
 
-function notionHeaders() {
-  const credentials = getNotionCredentials();
-  return {
-    "Authorization": `Bearer ${credentials.apiKey}`,
-    "Content-Type": "application/json",
-    "Notion-Version": "2022-06-28"
-  };
-}
-
-/**
- * Update status for Notion page.
- */
-function updateNotionStatus(pageId, newStatus, newDate) {
-  if (!pageId) {
-    Logger.log("Error: Attempted to update Notion page with undefined pageId");
-    return;
-  }
-  
-  const payload = {
-    properties: {
-      "Status": { select: { name: newStatus } },
-      "Date": { date: { start: newDate.toISOString() } }
-    }
-  };
-
-  const options = {
-    method: "patch",
-    headers: notionHeaders(),
-    payload: JSON.stringify(payload),
-    muteHttpExceptions: true
-  };
-
-  try {
-    const response = UrlFetchApp.fetch(`https://api.notion.com/v1/pages/${pageId}`, options);
-    const code = response.getResponseCode();
-    if (code >= 400) {
-      Logger.log("Failed to update Notion status: " + response.getContentText());
-    } else {
-      Logger.log(`Updated Notion page: ${pageId}`);
-    }
-  } catch (e) {
-    Logger.log("Error updating Notion page: " + e.message);
-  }
-}
-
-/**
- * Track processed thread IDs to avoid duplicates.
- */
-function getProcessedThreadData(threadId) {
-  const json = PropertiesService.getScriptProperties().getProperty(`thread_${threadId}`);
-  return json ? JSON.parse(json) : null;
-}
-
-function markThreadProcessed(threadId, notionPageId, status, date) {
-  const data = { pageId: notionPageId, status: status, date: date };
-  PropertiesService.getScriptProperties().setProperty(`thread_${threadId}`, JSON.stringify(data));
-}
-
-/**
- * Create a Notion entry.
- */
-function createNotionEntry(data) {
-  const credentials = getNotionCredentials();
-  const payload = {
-    parent: { database_id: credentials.databaseId },
-    properties: {
-      "Company": { title: [{ text: { content: data.company } }] },
-      "Job Title": { rich_text: [{ text: { content: data.jobTitle } }] },
-      "Status": { select: { name: data.status } },
-      "Email Subject": { rich_text: [{ text: { content: data.subject } }] },
-      "Snippet": { rich_text: [{ text: { content: data.snippet } }] },
-      "Date": { date: { start: data.date.toISOString() } },
-      "From": { email: data.emailAddress }
-    }
-  };
-
-  const options = {
-    method: "post",
-    headers: notionHeaders(),
-    payload: JSON.stringify(payload),
-    muteHttpExceptions: true
-  };
-
-  try {
-    const response = UrlFetchApp.fetch("https://api.notion.com/v1/pages", options);
-    const code = response.getResponseCode();
-    if (code >= 400) {
-      Logger.log("Error creating Notion entry: " + response.getContentText());
-      return null;
-    }
-    const responseData = JSON.parse(response.getContentText());
-    return responseData.id; // ✅ Return Notion page ID
-  } catch (e) {
-    Logger.log("Error posting to Notion: " + e.message);
-    return null;
-  }
-}
-
-/**
- * Clears the Notion database (use with caution).
- */
-function clearNotionDatabase() {
-  const credentials = getNotionCredentials();
-  const options = {
-    method: 'get',
-    headers: notionHeaders()
-  };
-  
-  try {
-    const response = UrlFetchApp.fetch(`https://api.notion.com/v1/databases/${credentials.databaseId}/query`, options);
-    const data = JSON.parse(response.getContentText());
-    const ids = data.results.map(result => result.id);
-    
-    ids.forEach(id => {
-      const deleteOptions = {
-        method: 'delete',
-        headers: notionHeaders()
-      };
-      
-      UrlFetchApp.fetch(`https://api.notion.com/v1/pages/${id}`, deleteOptions);
-      Logger.log(`Deleted page: ${id}`);
-    });
-  } catch (e) {
-    Logger.log("Error clearing Notion database: " + e.message);
-  }
+// Function to format date for Notion
+function formatDateForNotion(date) {
+  return Utilities.formatDate(date, Session.getScriptTimeZone(), 'yyyy-MM-dd');
 }
